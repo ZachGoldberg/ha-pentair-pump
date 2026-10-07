@@ -13,7 +13,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     if discovery_info is None:
         return
     controller = hass.data[DOMAIN]
-    async_add_entities([PumpSpeed(controller), PumpPower(controller), PumpStatusSensor(controller)])
+    async_add_entities([PumpSpeed(controller), PumpPower(controller), PumpStatusSensor(controller), PumpCommand(controller)])
 
 
 class PumpSpeed(PumpEntity, SensorEntity):
@@ -96,4 +96,26 @@ class PumpStatusSensor(PumpEntity, SensorEntity):
             "pump_clock": status.clock if status else None,
             "last_seen": controller.last_seen,
             "last_error": controller.last_error,
+        }
+
+
+class PumpCommand(PumpEntity, SensorEntity):
+    """What HA is telling the pump and why. Changes only when the command changes, so the
+    entity's history is a clean timeline of commands (raw frames are in the packet log)."""
+
+    def __init__(self, controller):
+        super().__init__(controller, "command", "Pool pump command", "mdi:console-line")
+
+    @property
+    def native_value(self):
+        controller = self.controller
+        return f"{controller.command}: {controller.command_reason}"[:255]
+
+    @property
+    def extra_state_attributes(self):
+        controller = self.controller
+        return {
+            "command": controller.command,
+            "reason": controller.command_reason,
+            "frames": controller.last_command_frames,
         }

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from collections.abc import Callable
 
@@ -40,6 +41,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 
 from .protocol import (
+    describe_frame,
     ACTION_REMOTE,
     ACTION_RUN,
     ACTION_SET,
@@ -51,6 +53,12 @@ from .protocol import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+# Every frame sent and received, decoded (like njsPC's packet log). Written to its own rotating
+# file; also echoed to the HA log when this integration's logger is at DEBUG.
+_PACKETS = logging.getLogger(__name__ + ".packets")
+PACKET_LOG_FILE = "pentair_pump_packets.log"
+PACKET_LOG_BYTES = 5_000_000
+PACKET_LOG_BACKUPS = 2
 
 DOMAIN = "pentair_pump"
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.SWITCH, Platform.SELECT, Platform.BINARY_SENSOR]
@@ -77,6 +85,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional("heat_entities", default=[]): cv.entity_ids,
                 vol.Optional("power_entities", default=[]): cv.entity_ids,
                 vol.Optional("min_speed_entity"): cv.entity_id,
+                vol.Optional("packet_log", default=True): cv.boolean,
             }
         )
     },
@@ -117,6 +126,10 @@ class PumpController:
         self.last_error: str | None = None
         self.commanded_rpm: int | None = None
         self.commanded_running: bool | None = None
+        # What we're telling the pump and why, e.g. "Run 2800 rpm" / "minimum for heater firing".
+        self.command = "Status only"
+        self.command_reason = "pump keypad schedule"
+        self.last_command_frames: list[str] = []
         # pentair_pump.ensure_speed: treat as heating until this time, so the pump is already up
         # to speed when the heater mode changes.
         self.prepare_heat_until = 0.0
@@ -167,22 +180,39 @@ class PumpController:
     def interlock_active(self) -> bool:
         return self.min_rpm > 0
 
+    def floor_reasons(self) -> list[str]:
+        reasons = []
+        if self.heating:
+            reasons.append("heating")
+        if self.min_speed_entity:
+            state = self.hass.states.get(self.min_speed_entity)
+            if state is not None:
+                reasons += [str(reason) for reason in (state.attributes.get("reasons") or [])]
+        return reasons
+
     def desired(self) -> tuple[bool, bool, int]:
         """(take_control, run, rpm) for this cycle."""
+        take_control, run, rpm, _reason = self.desired_with_reason()
+        return take_control, run, rpm
+
+    def desired_with_reason(self) -> tuple[bool, bool, int, str]:
         floor = self.min_rpm
         if self.control == CONTROL_HOME_ASSISTANT:
             run, rpm = self.run_requested, self.target_rpm
+            reason = f"Home Assistant target {rpm} rpm" if run else "stopped by Home Assistant"
         elif floor:
             # Keypad schedule, but something needs flow: keep its speed if it's already fast enough.
             run, rpm = True, self.status.rpm if self.status and self.status.running else floor
+            reason = "keypad schedule"
         else:
-            return False, False, 0
-        if floor:
-            # Stopped by the schedule but something needs flow: run at exactly the floor, not at
-            # whatever speed was last scheduled.
+            return False, False, 0, "pump keypad schedule"
+        if floor and (not run or rpm < floor):
+            # Stopped by the schedule (or too slow) but something needs flow: run at exactly the
+            # floor, not at whatever speed was last scheduled.
+            reason = f"minimum {floor} rpm for {' + '.join(self.floor_reasons()) or 'flow'}"
             rpm = max(rpm, floor) if run else floor
             run = True
-        return True, run, max(MIN_RPM, min(MAX_RPM, rpm))
+        return True, run, max(MIN_RPM, min(MAX_RPM, rpm)), reason
 
     # ---- listeners -----------------------------------------------------------------------------
 
@@ -210,6 +240,8 @@ class PumpController:
         )
 
     async def async_set_control(self, control: str) -> None:
+        if control != self.control:
+            _LOGGER.info("Pentair pump control: %s -> %s", self.control, control)
         self.control = control
         self._save()
         self.wake()
@@ -218,12 +250,15 @@ class PumpController:
         # Setting a speed means "run at this speed now" (the dashboard slider, or the schedule
         # starting a block); the schedule's next off-block turns it back off.
         self.target_rpm = max(MIN_RPM, min(MAX_RPM, int(rpm)))
+        _LOGGER.info("Pentair pump target speed set to %d rpm (run)", self.target_rpm)
         self.run_requested = True
         self.control = CONTROL_HOME_ASSISTANT
         self._save()
         self.wake()
 
     async def async_set_run(self, run: bool) -> None:
+        if run != self.run_requested:
+            _LOGGER.info("Pentair pump %s requested", "run" if run else "stop")
         self.run_requested = run
         self.control = CONTROL_HOME_ASSISTANT
         self._save()
@@ -301,7 +336,16 @@ class PumpController:
     async def _cycle(self) -> None:
         if self._writer is None:
             self._reader, self._writer = await asyncio.wait_for(asyncio.open_connection(self.host, self.port), 5)
-        take_control, run, rpm = self.desired()
+            _LOGGER.info("Pentair pump: connected to %s:%s", self.host, self.port)
+            _PACKETS.info("--- connected to %s:%s", self.host, self.port)
+        take_control, run, rpm, reason = self.desired_with_reason()
+        command = (f"Run {rpm} rpm" if run else "Stop") if take_control else "Status only"
+        if (command, reason) != (self.command, self.command_reason):
+            _LOGGER.info("Pentair pump command: %s (%s) — was %s (%s)", command, reason, self.command, self.command_reason)
+            self.command, self.command_reason = command, reason
+        if take_control and not self.holding_remote:
+            _LOGGER.info("Pentair pump: taking remote control")
+        self._cycle_frames: list[str] = []
         if take_control:
             await self._exchange(ACTION_REMOTE, b"\xFF")
             self.holding_remote = True
@@ -310,9 +354,11 @@ class PumpController:
                 await self._exchange(ACTION_SET, REGISTER_SPEED + bytes([rpm >> 8, rpm & 0xFF]))
             self.commanded_running, self.commanded_rpm = run, rpm if run else 0
         elif self.holding_remote:
+            _LOGGER.info("Pentair pump: releasing to the keypad schedule")
             await self._exchange(ACTION_REMOTE, b"\x00")
             self.holding_remote = False
             self.commanded_running = self.commanded_rpm = None
+        self.last_command_frames = self._cycle_frames
         status = None
         for _ in range(STATUS_TRIES):
             reply = await self._exchange(ACTION_STATUS)
@@ -328,7 +374,11 @@ class PumpController:
     async def _exchange(self, action: int, data: bytes = b""):
         """Send one frame and return the pump's reply to that action (or None)."""
         assert self._reader and self._writer
-        self._writer.write(build_frame(self.address, OUR_ADDRESS, action, data))
+        outgoing = build_frame(self.address, OUR_ADDRESS, action, data)
+        self._log_frame("TX", outgoing)
+        if action != ACTION_STATUS and hasattr(self, "_cycle_frames"):
+            self._cycle_frames.append(outgoing.hex(" "))
+        self._writer.write(outgoing)
         await self._writer.drain()
         buffer = bytearray()
         deadline = time.monotonic() + REPLY_SECONDS
@@ -342,8 +392,22 @@ class PumpController:
             buffer += chunk
             for frame in parse_frames(bytes(buffer)):
                 if frame.source == self.address and frame.action == action and frame.checksum_ok:
+                    self._log_frame("RX", bytes(buffer))
                     return frame
+        self._log_frame("RX", bytes(buffer), timed_out=True)
         return None
+
+    def _log_frame(self, direction: str, raw: bytes, timed_out: bool = False) -> None:
+        if not (_PACKETS.isEnabledFor(logging.INFO) or _LOGGER.isEnabledFor(logging.DEBUG)):
+            return
+        if not raw:
+            line = f"{direction} (no reply within {REPLY_SECONDS:.1f} s)" if timed_out else f"{direction} (empty)"
+        else:
+            frames = parse_frames(raw)
+            meaning = " ; ".join(describe_frame(frame) for frame in frames) or "unparsed bytes"
+            line = f"{direction} {meaning} | {raw.hex(' ')}" + (" (no matching reply)" if timed_out else "")
+        _PACKETS.info(line)
+        _LOGGER.debug("packet %s", line)
 
     async def _close(self) -> None:
         if self._writer:
@@ -356,11 +420,24 @@ class PumpController:
         self.holding_remote = False
 
 
+def _setup_packet_log(path: str) -> None:
+    """Rotating file like njsPC's packet log (opened in the executor: file I/O)."""
+    if any(isinstance(handler, RotatingFileHandler) for handler in _PACKETS.handlers):
+        return
+    handler = RotatingFileHandler(path, maxBytes=PACKET_LOG_BYTES, backupCount=PACKET_LOG_BACKUPS)
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(message)s", "%Y-%m-%d %H:%M:%S"))
+    _PACKETS.addHandler(handler)
+    _PACKETS.setLevel(logging.INFO)
+    _PACKETS.propagate = False  # keep the raw traffic out of home-assistant.log
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     if DOMAIN not in config:
         return True
     controller = PumpController(hass, config[DOMAIN])
     await controller.async_load()
+    if config[DOMAIN]["packet_log"]:
+        await hass.async_add_executor_job(_setup_packet_log, hass.config.path(PACKET_LOG_FILE))
     hass.data[DOMAIN] = controller
 
     @callback
