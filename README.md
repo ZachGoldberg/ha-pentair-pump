@@ -30,8 +30,10 @@ Jandy, Hayward or a plain timer. In that setup you usually want three things:
 
 njsPC can drive the pump too, and it's mature and excellent. But if your controller isn't Pentair,
 njsPC only runs the pump, and the rules about the heater, water features and so on still live in
-HA. You'd be running and syncing two systems to control one motor. This integration keeps it
-in one place. If you have a Pentair controller, or want njsPC's dashPanel UI, use njsPC or the
+HA, because that's where the controller's state is. You'd add a third system (your controller,
+Home Assistant and an njsPC service) and keep speeds and schedules in sync between njsPC and HA.
+This integration makes the pump part of Home Assistant itself: your controller plus HA, with no
+extra service, and the schedule and speed rules all in one place. If you have a Pentair controller, or want njsPC's dashPanel UI, use njsPC or the
 official integrations instead. Only one thing may talk to the pump at a time.
 
 ## What it does
