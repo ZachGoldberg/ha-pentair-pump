@@ -154,3 +154,8 @@ against.
 
 Not affiliated with or endorsed by Pentair. Protocol knowledge comes from the community,
 especially nodejs-poolController.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Original code; nodejs-poolController (AGPL-3.0) was consulted for
+protocol facts and timings only, and no code from it is included.

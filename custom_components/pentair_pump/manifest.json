@@ -1,10 +1,13 @@
 {
   "domain": "pentair_pump",
   "name": "Pentair pump (RS-485 over TCP)",
-  "codeowners": [],
+  "codeowners": [
+    "@ZachGoldberg"
+  ],
   "dependencies": [],
-  "documentation": "https://github.com/tagyoureit/nodejs-poolController/wiki",
+  "documentation": "https://github.com/ZachGoldberg/ha-pentair-pump",
   "iot_class": "local_polling",
   "requirements": [],
-  "version": "0.3.0"
+  "version": "0.3.0",
+  "issue_tracker": "https://github.com/ZachGoldberg/ha-pentair-pump/issues"
 }
