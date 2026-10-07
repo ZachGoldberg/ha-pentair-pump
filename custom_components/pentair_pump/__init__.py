@@ -307,6 +307,9 @@ class PumpController:
 
     async def _run(self) -> None:
         while True:
+            # Clear before the cycle, not after: a change requested while a cycle is running must
+            # trigger another cycle straight away instead of waiting for the next refresh.
+            self._wake.clear()
             try:
                 await self._cycle()
                 if self.missed_cycles:
@@ -335,7 +338,6 @@ class PumpController:
                 if not future.done():
                     future.set_result(None)
             self._status_waiters.clear()
-            self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), CYCLE_SECONDS)
             except asyncio.TimeoutError:
