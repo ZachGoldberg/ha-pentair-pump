@@ -68,8 +68,10 @@ CONTROL_HOME_ASSISTANT = "home_assistant"
 
 MIN_RPM = 450
 MAX_RPM = 3450
-CYCLE_SECONDS = 10
-REPLY_SECONDS = 0.8
+CYCLE_SECONDS = 5  # refresh remote control at least this often (njsPC: ~3-4 s)
+REPLY_SECONDS = 1.0  # per try, as njsPC
+CONTROL_TRIES = 2  # per control frame (04/06/01), as njsPC
+SETTLE_SECONDS = 1.0  # after run/speed commands, before reading status (as njsPC)
 STATUS_TRIES = 2  # per cycle
 OFFLINE_AFTER_MISSES = 3  # consecutive cycles without a status reply before entities show offline
 OUR_ADDRESS = 0x21  # posing as a remote controller, as nodejs-poolController does
@@ -290,9 +292,15 @@ class PumpController:
     async def stop(self) -> None:
         if self._task:
             self._task.cancel()
+            # Wait for the loop to finish: it may be mid-read on the socket, and a second reader
+            # would fail and silently skip handing the pump back.
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if self.holding_remote and self._writer:
             try:
-                await self._exchange(ACTION_REMOTE, b"\x00")
+                await self._control(ACTION_REMOTE, b"\x00")
             except Exception:  # noqa: BLE001 - best effort on shutdown
                 pass
         await self._close()
@@ -347,15 +355,17 @@ class PumpController:
             _LOGGER.info("Pentair pump: taking remote control")
         self._cycle_frames: list[str] = []
         if take_control:
-            await self._exchange(ACTION_REMOTE, b"\xFF")
+            await self._control(ACTION_REMOTE, b"\xFF")
             self.holding_remote = True
-            await self._exchange(ACTION_RUN, b"\x0A" if run else b"\x04")
+            await self._control(ACTION_RUN, b"\x0A" if run else b"\x04")
             if run:
-                await self._exchange(ACTION_SET, REGISTER_SPEED + bytes([rpm >> 8, rpm & 0xFF]))
+                await self._control(ACTION_SET, REGISTER_SPEED + bytes([rpm >> 8, rpm & 0xFF]))
             self.commanded_running, self.commanded_rpm = run, rpm if run else 0
+            # Give the drive a moment before asking for status, so it reports the new command.
+            await asyncio.sleep(SETTLE_SECONDS)
         elif self.holding_remote:
             _LOGGER.info("Pentair pump: releasing to the keypad schedule")
-            await self._exchange(ACTION_REMOTE, b"\x00")
+            await self._control(ACTION_REMOTE, b"\x00")
             self.holding_remote = False
             self.commanded_running = self.commanded_rpm = None
         self.last_command_frames = self._cycle_frames
@@ -370,6 +380,16 @@ class PumpController:
         self.status = status
         self.connected = True
         self.last_seen = time.time()
+
+    async def _control(self, action: int, data: bytes) -> bool:
+        """Send a control frame, retrying once if the pump doesn't acknowledge it."""
+        for attempt in range(1, CONTROL_TRIES + 1):
+            if await self._exchange(action, data) is not None:
+                return True
+            if attempt < CONTROL_TRIES:
+                _PACKETS.info("retrying action %#04x (try %d of %d)", action, attempt + 1, CONTROL_TRIES)
+        _LOGGER.debug("Pentair pump: no acknowledgement for action %#04x after %d tries", action, CONTROL_TRIES)
+        return False
 
     async def _exchange(self, action: int, data: bytes = b""):
         """Send one frame and return the pump's reply to that action (or None)."""
@@ -391,7 +411,8 @@ class PumpController:
                 raise ConnectionError("EW11 closed the connection")
             buffer += chunk
             for frame in parse_frames(bytes(buffer)):
-                if frame.source == self.address and frame.action == action and frame.checksum_ok:
+                if (frame.source == self.address and frame.action == action and frame.checksum_ok
+                        and _acknowledges(action, data, frame.data)):
                     self._log_frame("RX", bytes(buffer))
                     return frame
         self._log_frame("RX", bytes(buffer), timed_out=True)
@@ -418,6 +439,15 @@ class PumpController:
                 pass
         self._reader = self._writer = None
         self.holding_remote = False
+
+
+def _acknowledges(action: int, sent: bytes, reply: bytes) -> bool:
+    """Is this reply really the pump's answer to what we sent? (njsPC checks the same way.)"""
+    if action == ACTION_STATUS:
+        return True
+    if action == ACTION_SET and len(sent) == 4:
+        return reply[:2] == sent[2:4]  # the speed ack echoes the RPM
+    return reply == sent  # remote / run acks mirror the request
 
 
 def _setup_packet_log(path: str) -> None:

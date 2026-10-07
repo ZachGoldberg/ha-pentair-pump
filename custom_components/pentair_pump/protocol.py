@@ -39,7 +39,11 @@ def parse_frames(buffer: bytes) -> list[Frame]:
         length = buffer[index + 5]
         end = index + 6 + length + 2
         if end > len(buffer):
-            break
+            # Not a complete frame (yet): a stray A5, or the start of a frame still arriving. Keep
+            # scanning so a stray byte can't hide a real reply after it; the caller re-parses the
+            # whole buffer as more bytes arrive.
+            index += 1
+            continue
         body = buffer[index : index + 6 + length]
         checksum_ok = sum(body) == (buffer[end - 2] << 8 | buffer[end - 1])
         frames.append(Frame(buffer[index + 2], buffer[index + 3], buffer[index + 4], bytes(buffer[index + 6 : index + 6 + length]), checksum_ok))
